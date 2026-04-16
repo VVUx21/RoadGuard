@@ -9,7 +9,7 @@
 
 <!-- Google Identity Services -->
 <script src="https://accounts.google.com/gsi/client" async defer></script>
-<script src="https://maps.googleapis.com/maps/api/js?key=YOUR_GOOGLE_MAPS_API_KEY&callback=initRoadMap" async defer></script>
+<script src="https://maps.googleapis.com/maps/api/js?key=AIzaSyCFkTFQE6phZo1hkZdbav4L83pqQB8_U0M&callback=initRoadMap" async defer></script>
 
 <style>
 :root {
@@ -1051,6 +1051,12 @@ let currentUser = null;
 let currentUploadContext = null;
 let roadMap = null;
 let roadMapInfoWindow = null;
+const pendingMapPins = [];
+const API_BASE_URL = (
+  window.ROADGUARD_API_BASE_URL ||
+  localStorage.getItem('roadguard_api_base_url') ||
+  'http://127.0.0.1:5000'
+).replace(/\/+$/, '');
 const leaderboardData = [
   { name: 'Rahul Verma', email: 'rahul@roadguard.app', points: 540, uploads: 62, badge: '🚧 Road Guardian', tone: '#f0a500' },
   { name: 'Anmol Kumar', email: 'anmol@roadguard.app', points: 480, uploads: 48, badge: '🗺 City Contributor', tone: '#1daa75' },
@@ -1066,6 +1072,45 @@ const seedPins = [
 
 function initialsFor(name) {
   return (name || 'RG').split(' ').filter(Boolean).slice(0, 2).map(n => n[0].toUpperCase()).join('');
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function setProgress(percent, label) {
+  document.getElementById('progressBar').style.width = percent + '%';
+  document.getElementById('progressPct').textContent = percent + '%';
+  document.getElementById('progressLabel').textContent = label;
+}
+
+async function checkBackendHealth() {
+  try {
+    const res = await fetch(`${API_BASE_URL}/health`);
+    const payload = await res.json();
+    const ok = !!payload.ok;
+    if (!ok) {
+      showToast('Backend reachable, but ML models are not fully loaded yet.', '⚠️');
+    }
+  } catch (_) {
+    showToast('Flask backend is offline. Start python flask_server.py first.', '⚠️');
+  }
+}
+
+async function requestPrediction(file) {
+  const formData = new FormData();
+  formData.append('image', file);
+
+  const res = await fetch(`${API_BASE_URL}/predict`, {
+    method: 'POST',
+    body: formData,
+  });
+
+  const payload = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(payload.error || 'Prediction request failed.');
+  }
+  return payload;
 }
 
 function renderLeaderboard() {
@@ -1294,29 +1339,32 @@ function renderUploadedFiles() {
 
 window.getUploadedFiles = () => [...uploadedFiles];
 
-function startProcessing(file) {
+async function startProcessing(file) {
   document.getElementById('dropZone').style.display='none';
   document.getElementById('processingState').style.display='block';
   document.getElementById('fileName').textContent = '📁 ' + file.name;
-  const steps = [
-    [10, 'Loading YOLOv8 model…'],
-    [30, 'Uploading photo to Drive…'],
-    [52, 'Running neural network inference…'],
-    [75, 'Predicting severity color…'],
-    [92, 'Pinning pothole to Google Map…'],
-    [100, 'Updating leaderboard points…']
-  ];
-  let i = 0;
-  const bar = document.getElementById('progressBar');
-  const pct = document.getElementById('progressPct');
-  const lbl = document.getElementById('progressLabel');
-  const iv = setInterval(() => {
-    if(i >= steps.length) { clearInterval(iv); setTimeout(showResults, 400); return; }
-    bar.style.width = steps[i][0]+'%';
-    pct.textContent = steps[i][0]+'%';
-    lbl.textContent = steps[i][1];
-    i++;
-  }, 650);
+  setProgress(8, 'Preparing upload...');
+
+  try {
+    await sleep(180);
+    setProgress(25, 'Syncing photo metadata...');
+    await sleep(180);
+    setProgress(42, 'Calling Flask inference API...');
+
+    const prediction = await requestPrediction(file);
+
+    setProgress(78, 'Updating map and rewards...');
+    await sleep(150);
+    setProgress(100, 'Complete');
+
+    setTimeout(() => showResults(prediction), 220);
+  } catch (err) {
+    document.getElementById('processingState').style.display='none';
+    document.getElementById('dropZone').style.display='block';
+    document.getElementById('dropZone').style.borderColor='rgba(240,165,0,0.35)';
+    document.getElementById('dropZone').style.background='var(--bg2)';
+    showToast(err.message || 'Prediction failed. Check backend logs.', '⚠️');
+  }
 }
 
 function upsertCurrentUserPoints(earnedPoints) {
@@ -1341,39 +1389,49 @@ function upsertCurrentUserPoints(earnedPoints) {
   renderLeaderboard();
 }
 
-function showResults() {
+function showResults(prediction) {
   document.getElementById('processingState').style.display='none';
   document.getElementById('resultsState').style.display='block';
 
-  const severe = Math.floor(Math.random()*4)+1;
-  const moderate = Math.floor(Math.random()*5)+2;
-  const minor = Math.floor(Math.random()*6)+2;
-  const total = severe+moderate+minor;
-  const pts = total*10;
-  const health = Math.max(20, 100 - severe*15 - moderate*7 - minor*3);
+  const detection = String(prediction.detection || '').toLowerCase();
+  const severity = String(prediction.severity || '').toLowerCase();
+  const isPothole = detection === 'pothole';
 
-  const dominant = severe >= moderate && severe >= minor
-    ? { label: 'Severe', colorName: 'Red', colorHex: '#e24b4a' }
-    : moderate >= minor
-      ? { label: 'Moderate', colorName: 'Amber', colorHex: '#f0a500' }
-      : { label: 'Minor', colorName: 'Green', colorHex: '#1daa75' };
+  const severe = isPothole && severity === 'severe' ? 1 : 0;
+  const moderate = isPothole && severity === 'moderate' ? 1 : 0;
+  const minor = isPothole && severity === 'minor' ? 1 : 0;
+
+  let dominant;
+  if (severe) dominant = { label: 'Severe', colorName: 'Red', colorHex: '#e24b4a' };
+  else if (moderate) dominant = { label: 'Moderate', colorName: 'Amber', colorHex: '#f0a500' };
+  else if (minor) dominant = { label: 'Minor', colorName: 'Green', colorHex: '#1daa75' };
+  else dominant = { label: 'Normal', colorName: 'Green', colorHex: '#1daa75' };
+
+  const pts = severe ? 30 : moderate ? 20 : minor ? 10 : 2;
+  const health = severe ? 35 : moderate ? 60 : minor ? 82 : 96;
+  const binaryConfidencePct = Math.round((Number(prediction.binary_confidence) || 0) * 100);
+  const severityConfidencePct = prediction.severity_confidence == null
+    ? null
+    : Math.round((Number(prediction.severity_confidence) || 0) * 100);
 
   document.getElementById('res-severe').textContent=severe;
   document.getElementById('res-moderate').textContent=moderate;
   document.getElementById('res-minor').textContent=minor;
   document.getElementById('res-pts').textContent='🏆 +'+pts+' points earned';
-  document.getElementById('res-health').textContent='Road health score: '+health+'/100';
-  document.getElementById('res-color').innerHTML=`Predicted color: <strong style="color:${dominant.colorHex}">${dominant.colorName}</strong> (${dominant.label})`;
+  document.getElementById('res-health').textContent='Road health score: '+health+'/100 · Detection confidence: '+binaryConfidencePct+'%';
+  document.getElementById('res-color').innerHTML=`Predicted color: <strong style="color:${dominant.colorHex}">${dominant.colorName}</strong> (${dominant.label})${severityConfidencePct == null ? '' : ' · Severity confidence: ' + severityConfidencePct + '%'}`;
   document.getElementById('res-location').textContent=`📍 Location: ${currentUploadContext.lat.toFixed(5)}, ${currentUploadContext.lng.toFixed(5)}`;
   document.getElementById('res-drive').innerHTML=`☁️ Drive sync: <a href="${currentUploadContext.driveLink}" target="_blank" style="color:var(--amber)">Open uploaded photo</a>`;
 
-  addPotholePin({
-    lat: currentUploadContext.lat,
-    lng: currentUploadContext.lng,
-    severity: dominant.label,
-    color: dominant.colorHex,
-    reporter: currentUser ? `${currentUser.name} (${currentUser.email})` : 'Guest user'
-  });
+  if (isPothole) {
+    addPotholePin({
+      lat: currentUploadContext.lat,
+      lng: currentUploadContext.lng,
+      severity: dominant.label,
+      color: dominant.colorHex,
+      reporter: currentUser ? `${currentUser.name} (${currentUser.email})` : 'Guest user'
+    });
+  }
   upsertCurrentUserPoints(pts);
 }
 
@@ -1389,7 +1447,10 @@ function resetUpload() {
 
 /* ── GOOGLE MAP ── */
 function addPotholePin(pin) {
-  if (!window.google || !window.google.maps || !roadMap) return;
+  if (!window.google || !window.google.maps || !roadMap) {
+    pendingMapPins.push(pin);
+    return;
+  }
 
   const marker = new google.maps.Marker({
     position: { lat: pin.lat, lng: pin.lng },
@@ -1409,6 +1470,9 @@ function addPotholePin(pin) {
     roadMapInfoWindow.setContent(`<strong>${pin.severity} pothole</strong><br/>Reporter: ${pin.reporter}`);
     roadMapInfoWindow.open({ anchor: marker, map: roadMap });
   });
+
+  // Keep latest report visible on the map.
+  roadMap.panTo({ lat: pin.lat, lng: pin.lng });
 }
 
 function initRoadMap() {
@@ -1431,6 +1495,11 @@ function initRoadMap() {
 
   roadMapInfoWindow = new google.maps.InfoWindow();
   seedPins.forEach(addPotholePin);
+
+  // Flush any pins generated before map initialization completed.
+  while (pendingMapPins.length > 0) {
+    addPotholePin(pendingMapPins.shift());
+  }
 }
 
 window.initRoadMap = initRoadMap;
@@ -1455,6 +1524,7 @@ document.getElementById('useCurrentLocationBtn').addEventListener('click', () =>
 // Init state on load
 updateNavState();
 renderLeaderboard();
+checkBackendHealth();
 </script>
 </body>
 </html>
